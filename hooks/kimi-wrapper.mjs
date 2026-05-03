@@ -142,9 +142,18 @@ process.stdin.on('end', async () => {
   try {
     switch (event) {
       case 'SessionStart': {
-        const r = await request(`/api/context/inject?cwd=${encodeURIComponent(payload.cwd || process.cwd())}`, 'GET');
-        if (r && typeof r === 'string' && r.trim()) {
-          console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: r } }));
+        const cwd = payload.cwd || process.cwd();
+        const project = path.basename(cwd);
+        const r = await request(`/api/context/inject?projects=${encodeURIComponent(project)}&cwd=${encodeURIComponent(cwd)}`, 'GET');
+        let ctx = '';
+        if (r) {
+          if (typeof r === 'string') ctx = r;
+          else if (r.content && typeof r.content === 'string') ctx = r.content;
+          else if (r.error) ctx = '';
+          else try { ctx = JSON.stringify(r); } catch { ctx = String(r); }
+        }
+        if (ctx && ctx.trim()) {
+          console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: ctx } }));
         }
         break;
       }
