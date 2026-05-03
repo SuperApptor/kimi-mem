@@ -1,41 +1,112 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import fs from 'node:fs';
 
 const event = process.argv[2];
 if (!event) { process.stderr.write('Usage: node kimi-wrapper.mjs <event>\n'); process.exit(1); }
 
-const HOME = os.homedir();
-const PLATFORM = os.platform();
-const BUN_PATH = process.env.BUN_PATH || path.join(HOME, '.bun', 'bin', PLATFORM === 'win32' ? 'bun.exe' : 'bun');
-const WORKER_PATH = process.env.CLAUDE_MEM_WORKER_PATH || path.join(HOME, '.claude-mem-install', 'node_modules', 'claude-mem', 'plugin', 'scripts', 'worker-service.cjs');
+function getWorkerPort() {
+  try {
+    const raw = fs.readFileSync(path.join(os.homedir(), '.claude-mem', 'settings.json'), 'utf8');
+    const settings = JSON.parse(raw);
+    return settings.CLAUDE_MEM_WORKER_PORT || '37778';
+  } catch { return '37778'; }
+}
+
+function request(pathStr, method = 'GET', body = null) {
+  const port = getWorkerPort();
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname: 'localhost', port, path: pathStr, method, headers: body ? { 'Content-Type': 'application/json' } : {}, timeout: 15000 }, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ content: data }); } });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => reject(new Error('Request timeout')));
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
 
 let rawInput = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { rawInput += chunk; });
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
   let payload = {};
   try { payload = JSON.parse(rawInput || '{}'); } catch { payload = {}; }
 
-  const mapped = {
-    session_id: payload.session_id, cwd: payload.cwd, prompt: payload.prompt,
-    tool_name: payload.tool_name, tool_input: payload.tool_input,
-    tool_response: payload.tool_output ?? (payload.error ? { error: payload.error } : undefined),
-    file_path: payload.file_path ?? payload.tool_input?.path ?? payload.tool_input?.file_path,
-    metadata: {},
-  };
-  if (payload.source) mapped.metadata.source = payload.source;
-  if (payload.reason) mapped.metadata.reason = payload.reason;
-  if (payload.stop_hook_active !== undefined) mapped.metadata.stop_hook_active = payload.stop_hook_active;
-  if (payload.hook_event_name) mapped.metadata.hook_event_name = payload.hook_event_name;
-  if (payload.trigger) mapped.metadata.trigger = payload.trigger;
-  if (payload.notification_type) mapped.metadata.notification_type = payload.notification_type;
-  if (payload.agent_name) mapped.metadata.agent_name = payload.agent_name;
+  const port = getWorkerPort();
 
-  const child = spawn(BUN_PATH, [WORKER_PATH, 'hook', 'raw', event], { stdio: ['pipe', 'inherit', 'inherit'], windowsHide: true });
-  child.stdin.write(JSON.stringify(mapped));
-  child.stdin.end();
-  child.on('exit', code => { process.exit(code ?? 0); });
-  child.on('error', err => { process.stderr.write(`Hook wrapper error: ${err.message}\n`); process.exit(0); });
+  try {
+    switch (event) {
+      case 'SessionStart': {
+        // context injection only
+        const r = await request(`/api/context/inject?cwd=${encodeURIComponent(payload.cwd || process.cwd())}`, 'GET');
+        if (r && typeof r === 'string' && r.trim()) {
+          console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: r } }));
+        }
+        break;
+      }
+      case 'UserPromptSubmit': {
+        const body = {
+          contentSessionId: payload.session_id || 'unknown',
+          project: payload.cwd ? path.basename(payload.cwd) : 'unknown',
+          prompt: payload.prompt || '',
+          platformSource: 'kimi'
+        };
+        await request('/api/sessions/init', 'POST', body);
+        break;
+      }
+      case 'PostToolUse':
+      case 'PostToolUseFailure': {
+        const body = {
+          contentSessionId: payload.session_id || 'unknown',
+          platformSource: 'kimi',
+          tool_name: payload.tool_name,
+          tool_input: payload.tool_input,
+          tool_response: payload.tool_output ?? (payload.error ? { error: payload.error } : undefined),
+          cwd: payload.cwd || process.cwd(),
+          agentId: payload.agent_id,
+          agentType: payload.agent_type
+        };
+        await request('/api/sessions/observations', 'POST', body);
+        break;
+      }
+      case 'PreToolUse': {
+        const filePath = payload.tool_input?.path || payload.tool_input?.file_path;
+        if (!filePath) break;
+        const body = {
+          contentSessionId: payload.session_id || 'unknown',
+          platformSource: 'kimi',
+          tool_name: payload.tool_name,
+          tool_input: payload.tool_input,
+          tool_response: { success: true },
+          cwd: payload.cwd || process.cwd()
+        };
+        const r = await request('/api/sessions/observations', 'POST', body);
+        // file-context is handled via the observation endpoint in claude-mem
+        break;
+      }
+      case 'Stop': {
+        const body = {
+          contentSessionId: payload.session_id || 'unknown',
+          last_assistant_message: '',
+          platformSource: 'kimi'
+        };
+        await request('/api/sessions/summarize', 'POST', body);
+        break;
+      }
+      case 'SessionEnd': {
+        // no-op
+        break;
+      }
+    }
+    process.exit(0);
+  } catch (err) {
+    // Fail-open: never block Kimi
+    process.exit(0);
+  }
 });
