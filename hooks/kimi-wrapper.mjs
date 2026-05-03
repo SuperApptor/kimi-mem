@@ -3,7 +3,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 
 const event = process.argv[2];
 if (!event) { process.stderr.write('Usage: node kimi-wrapper.mjs <event>\n'); process.exit(1); }
@@ -12,7 +12,15 @@ const PLATFORM = os.platform();
 const IS_WIN = PLATFORM === 'win32';
 const HOME = os.homedir();
 const SETTINGS_PATH = path.join(HOME, '.claude-mem', 'settings.json');
-const SOCKET_PATH = IS_WIN ? '\\\\.\\pipe\\kimi-mem-v2' : path.join(HOME, '.claude-mem', 'kimi-mem.sock');
+function getSocketPath() {
+  if (!IS_WIN) return path.join(HOME, '.claude-mem', 'kimi-mem.sock');
+  try {
+    const pipeFile = path.join(HOME, '.claude-mem', 'pipe.name');
+    if (fs.existsSync(pipeFile)) return fs.readFileSync(pipeFile, 'utf8').trim();
+  } catch {}
+  return `\\\\.\\pipe\\kimi-mem-v2`;
+}
+const SOCKET_PATH = getSocketPath();
 
 /* ── Debug log (silent, never blocks Kimi) ───────────────────────────────── */
 const DEBUG_LOG = path.join(HOME, '.kimi', 'hooks', 'claude-mem', 'wrapper-debug.log');
@@ -34,9 +42,9 @@ function getWorkerPort() {
   return s.CLAUDE_MEM_WORKER_PORT || '37780';
 }
 
-/* ── HTTP request (named pipe on Win, TCP on Unix) ───────────────────────── */
+/* ── HTTP request with retry ─────────────────────────────────────────────── */
 function request(targetPath, method = 'GET', body = null) {
-  return new Promise((resolve, reject) => {
+  const doRequest = () => new Promise((resolve, reject) => {
     const opts = IS_WIN
       ? { socketPath: SOCKET_PATH, path: targetPath, method, headers: body ? { 'Content-Type': 'application/json' } : {}, timeout: 15000 }
       : { hostname: 'localhost', port: getWorkerPort(), path: targetPath, method, headers: body ? { 'Content-Type': 'application/json' } : {}, timeout: 15000 };
@@ -55,6 +63,32 @@ function request(targetPath, method = 'GET', body = null) {
     if (body) req.write(JSON.stringify(body));
     req.end();
   });
+
+  return doRequest().catch(async (err) => {
+    const retryable = err.code === 'ECONNREFUSED' || err.code === 'ENOENT' || err.message?.includes('timeout');
+    if (!retryable) throw err;
+    debug('request_retry', { path: targetPath, error: err.message });
+    await new Promise(r => setTimeout(r, 2000));
+    return doRequest();
+  });
+}
+
+/* ── Kill stale managers ─────────────────────────────────────────────────── */
+function killStaleManagers() {
+  if (!IS_WIN) return;
+  try {
+    const out = execSync('wmic process where "CommandLine like \'%worker-manager.mjs%\'" get ProcessId,CommandLine', { windowsHide: true, encoding: 'utf8', timeout: 5000 });
+    const lines = out.split('\n').filter(l => l.includes('worker-manager.mjs'));
+    for (const line of lines) {
+      const m = line.match(/(\d+)\s*$/);
+      if (m) {
+        try { execSync(`taskkill /F /PID ${m[1]}`, { windowsHide: true, timeout: 3000 }); } catch {}
+      }
+    }
+    debug('killed_stale_managers', { count: lines.length });
+  } catch {
+    // ignore errors (no stale managers)
+  }
 }
 
 /* ── Ensure manager is running (Windows only) ────────────────────────────── */
@@ -67,7 +101,9 @@ async function ensureManagerRunning() {
     debug('manager_not_responding');
   }
 
-  // Try to start manager
+  killStaleManagers();
+  await new Promise(r => setTimeout(r, 500));
+
   const managerPath = path.join(HOME, '.kimi', 'hooks', 'claude-mem', 'worker-manager.mjs');
   if (!fs.existsSync(managerPath)) {
     debug('manager_not_found', { path: managerPath });
@@ -82,7 +118,6 @@ async function ensureManagerRunning() {
     child.unref();
     debug('manager_spawned', { pid: child.pid });
 
-    // Wait a bit for manager + worker to come up
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 500));
       try { await request('/health', 'GET', null); return; }
