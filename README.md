@@ -1,13 +1,18 @@
 # kimi-mem 🧠
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D%2020-brightgreen)](https://nodejs.org/)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)]()
+
 Persistent memory for [Kimi Code CLI](https://moonshotai.github.io/kimi-cli/), powered by the [claude-mem](https://github.com/thedotmack/claude-mem) engine.
 
-```
-┌─────────────┐     hooks      ┌─────────────────┐     HTTP      ┌──────────────┐
-│  Kimi CLI   │ ─────────────→ │  kimi-wrapper   │ ────────────→ │ claude-mem   │
-│             │                │  (this repo)    │               │ worker       │
-│             │ ←───────────── │                 │ ←──────────── │ (AGPL-3.0)   │
-└─────────────┘   context      └─────────────────┘   search      └──────────────┘
+```mermaid
+graph LR
+    A[Kimi CLI] -- hooks --> B[kimi-wrapper]
+    B -- HTTP --> C[claude-mem worker]
+    A -- plugin --> D[mem-client]
+    D -- HTTP --> C
+    C -- context --> A
 ```
 
 ## ✨ Features
@@ -81,6 +86,10 @@ Open http://localhost:37778 in your browser to browse memory in real time.
 ## ⚠️ Troubleshooting
 
 See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+
+## 🤝 Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on bug reports, feature requests, and pull requests.
 
 ## 📜 License
 
