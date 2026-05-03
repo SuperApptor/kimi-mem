@@ -3,26 +3,52 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
 
 const event = process.argv[2];
 if (!event) { process.stderr.write('Usage: node kimi-wrapper.mjs <event>\n'); process.exit(1); }
 
-function getWorkerPort() {
+const PLATFORM = os.platform();
+const IS_WIN = PLATFORM === 'win32';
+const HOME = os.homedir();
+const SETTINGS_PATH = path.join(HOME, '.claude-mem', 'settings.json');
+const SOCKET_PATH = IS_WIN ? '\\\\.\\pipe\\kimi-mem-v2' : path.join(HOME, '.claude-mem', 'kimi-mem.sock');
+
+/* ── Debug log (silent, never blocks Kimi) ───────────────────────────────── */
+const DEBUG_LOG = path.join(HOME, '.kimi', 'hooks', 'claude-mem', 'wrapper-debug.log');
+function debug(label, meta = {}) {
   try {
-    const raw = fs.readFileSync(path.join(os.homedir(), '.claude-mem', 'settings.json'), 'utf8');
-    const settings = JSON.parse(raw);
-    return settings.CLAUDE_MEM_WORKER_PORT || '37778';
-  } catch { return '37778'; }
+    const line = JSON.stringify({ ts: new Date().toISOString(), event, label, ...meta }) + '\n';
+    fs.appendFileSync(DEBUG_LOG, line);
+  } catch {}
 }
 
-function request(pathStr, method = 'GET', body = null) {
-  const port = getWorkerPort();
+/* ── Settings ────────────────────────────────────────────────────────────── */
+function readSettings() {
+  try { return JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')); }
+  catch { return {}; }
+}
+
+function getWorkerPort() {
+  const s = readSettings();
+  return s.CLAUDE_MEM_WORKER_PORT || '37780';
+}
+
+/* ── HTTP request (named pipe on Win, TCP on Unix) ───────────────────────── */
+function request(targetPath, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ hostname: 'localhost', port, path: pathStr, method, headers: body ? { 'Content-Type': 'application/json' } : {}, timeout: 15000 }, (res) => {
+    const opts = IS_WIN
+      ? { socketPath: SOCKET_PATH, path: targetPath, method, headers: body ? { 'Content-Type': 'application/json' } : {}, timeout: 15000 }
+      : { hostname: 'localhost', port: getWorkerPort(), path: targetPath, method, headers: body ? { 'Content-Type': 'application/json' } : {}, timeout: 15000 };
+
+    const req = http.request(opts, (res) => {
       let data = '';
       res.setEncoding('utf8');
       res.on('data', chunk => data += chunk);
-      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ content: data }); } });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch { resolve({ content: data }); }
+      });
     });
     req.on('error', reject);
     req.on('timeout', () => reject(new Error('Request timeout')));
@@ -31,6 +57,44 @@ function request(pathStr, method = 'GET', body = null) {
   });
 }
 
+/* ── Ensure manager is running (Windows only) ────────────────────────────── */
+async function ensureManagerRunning() {
+  if (!IS_WIN) return;
+  try {
+    await request('/health', 'GET', null);
+    return;
+  } catch {
+    debug('manager_not_responding');
+  }
+
+  // Try to start manager
+  const managerPath = path.join(HOME, '.kimi', 'hooks', 'claude-mem', 'worker-manager.mjs');
+  if (!fs.existsSync(managerPath)) {
+    debug('manager_not_found', { path: managerPath });
+    return;
+  }
+
+  try {
+    const child = spawn(process.execPath, [managerPath, 'start'], {
+      detached: true,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    child.unref();
+    debug('manager_spawned', { pid: child.pid });
+
+    // Wait a bit for manager + worker to come up
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      try { await request('/health', 'GET', null); return; }
+      catch {}
+    }
+    debug('manager_never_ready');
+  } catch (e) {
+    debug('manager_spawn_error', { error: e.message });
+  }
+}
+
+/* ── Main ────────────────────────────────────────────────────────────────── */
 let rawInput = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { rawInput += chunk; });
@@ -38,12 +102,11 @@ process.stdin.on('end', async () => {
   let payload = {};
   try { payload = JSON.parse(rawInput || '{}'); } catch { payload = {}; }
 
-  const port = getWorkerPort();
+  await ensureManagerRunning();
 
   try {
     switch (event) {
       case 'SessionStart': {
-        // context injection only
         const r = await request(`/api/context/inject?cwd=${encodeURIComponent(payload.cwd || process.cwd())}`, 'GET');
         if (r && typeof r === 'string' && r.trim()) {
           console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: r } }));
@@ -86,8 +149,7 @@ process.stdin.on('end', async () => {
           tool_response: { success: true },
           cwd: payload.cwd || process.cwd()
         };
-        const r = await request('/api/sessions/observations', 'POST', body);
-        // file-context is handled via the observation endpoint in claude-mem
+        await request('/api/sessions/observations', 'POST', body);
         break;
       }
       case 'Stop': {
@@ -100,13 +162,12 @@ process.stdin.on('end', async () => {
         break;
       }
       case 'SessionEnd': {
-        // no-op
         break;
       }
     }
     process.exit(0);
   } catch (err) {
-    // Fail-open: never block Kimi
+    debug('hook_error', { error: err.message });
     process.exit(0);
   }
 });
