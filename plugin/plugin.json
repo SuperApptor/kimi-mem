@@ -1,0 +1,140 @@
+{
+  "name": "claude-mem",
+  "version": "1.0.0",
+  "description": "Native Kimi plugin for Claude-mem persistent memory search and context injection",
+  "tools": [
+    {
+      "name": "mem_search",
+      "description": "Step 1: Search memory index with IDs. Returns compact results (~50-100 tokens each). ALWAYS use FIRST before fetching details.",
+      "command": [
+        "node",
+        "scripts/mem-client.mjs",
+        "search"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "number"
+          },
+          "project": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "obs_type": {
+            "type": "string"
+          },
+          "dateStart": {
+            "type": "string"
+          },
+          "dateEnd": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "number"
+          },
+          "orderBy": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "mem_timeline",
+      "description": "Step 2: Get chronological context around an observation ID or query. Use AFTER mem_search.",
+      "command": [
+        "node",
+        "scripts/mem-client.mjs",
+        "timeline"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "anchor": {
+            "type": "number"
+          },
+          "query": {
+            "type": "string"
+          },
+          "depth_before": {
+            "type": "number"
+          },
+          "depth_after": {
+            "type": "number"
+          },
+          "project": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "mem_get_observations",
+      "description": "Step 3: Fetch full details for specific observation IDs. Use LAST after filtering with mem_search.",
+      "command": [
+        "node",
+        "scripts/mem-client.mjs",
+        "get_observations"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          }
+        },
+        "required": [
+          "ids"
+        ]
+      }
+    },
+    {
+      "name": "mem_context",
+      "description": "Inject relevant memory context for the current project/session.",
+      "command": [
+        "node",
+        "scripts/mem-client.mjs",
+        "context_inject"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "projects": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "mem_recent",
+      "description": "Get recent memory context without searching.",
+      "command": [
+        "node",
+        "scripts/mem-client.mjs",
+        "recent"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ],
+  "runtime": {
+    "host": "kimi-code",
+    "host_version": "1.39.0"
+  }
+}
